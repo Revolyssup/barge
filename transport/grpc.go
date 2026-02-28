@@ -3,157 +3,221 @@ package transport
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
-	"strings"
 	"sync"
+	"time"
 
-	pb "github.com/example/raft/proto"
+	pb "barge/proto"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// normalizeAddr ensures the address has a host component for dialing.
-// Converts ":9000" to "localhost:9000".
-func normalizeAddr(addr string) string {
-	if strings.HasPrefix(addr, ":") {
-		return "localhost" + addr
-	}
-	return addr
+// NodeHandler defines the interface that the consensus node must implement
+// to handle incoming RPCs
+type NodeHandler interface {
+	HandleAppendEntries(req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error)
+	HandleRequestVote(req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error)
+	HandleClientGet(req *pb.ClientGetRequest) (*pb.ClientGetResponse, error)
+	HandleClientSet(req *pb.ClientSetRequest) (*pb.ClientSetResponse, error)
 }
 
-// -------------------------------------------------------------------------
-// gRPC Client (Transport implementation)
-// -------------------------------------------------------------------------
-
-// GRPCTransport implements Transport using gRPC.
-// It maintains a pool of connections to peers.
+// GRPCTransport implements the Transport interface using gRPC
 type GRPCTransport struct {
-	mu    sync.Mutex
-	conns map[string]*grpc.ClientConn
+	pb.UnimplementedRaftServiceServer
+	mu      sync.RWMutex
+	handler NodeHandler
+	server  *grpc.Server
+	conns   map[string]*grpc.ClientConn
 }
 
+// NewGRPCTransport creates a new gRPC transport
 func NewGRPCTransport() *GRPCTransport {
-	return &GRPCTransport{conns: make(map[string]*grpc.ClientConn)}
+	return &GRPCTransport{
+		conns: make(map[string]*grpc.ClientConn),
+	}
 }
 
-func (t *GRPCTransport) dial(addr string) (pb.RaftServiceClient, error) {
+// RegisterHandler registers the node handler for incoming RPCs
+func (t *GRPCTransport) RegisterHandler(handler NodeHandler) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if conn, ok := t.conns[addr]; ok {
-		return pb.NewRaftServiceClient(conn), nil
-	}
-	dialAddr := normalizeAddr(addr)
-	conn, err := grpc.Dial(dialAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", dialAddr, err)
-	}
-	t.conns[addr] = conn
-	return pb.NewRaftServiceClient(conn), nil
+	t.handler = handler
 }
 
-func (t *GRPCTransport) Close() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	for _, c := range t.conns {
-		c.Close()
-	}
-}
-
-func (t *GRPCTransport) SendRequestVote(ctx context.Context, addr string, args RequestVoteArgs) (RequestVoteReply, error) {
-	client, err := t.dial(addr)
-	if err != nil {
-		return RequestVoteReply{}, err
-	}
-	resp, err := client.RequestVote(ctx, &pb.RequestVoteRequest{
-		Term:         args.Term,
-		CandidateId:  args.CandidateID,
-		LastLogIndex: args.LastLogIndex,
-		LastLogTerm:  args.LastLogTerm,
-	})
-	if err != nil {
-		return RequestVoteReply{}, err
-	}
-	return RequestVoteReply{Term: resp.Term, VoteGranted: resp.VoteGranted}, nil
-}
-
-func (t *GRPCTransport) SendAppendEntries(ctx context.Context, addr string, args AppendEntriesArgs) (AppendEntriesReply, error) {
-	client, err := t.dial(addr)
-	if err != nil {
-		return AppendEntriesReply{}, err
-	}
-	pbEntries := make([]*pb.LogEntry, len(args.Entries))
-	for i, e := range args.Entries {
-		pbEntries[i] = &pb.LogEntry{Index: e.Index, Term: e.Term, Command: e.Command}
-	}
-	resp, err := client.AppendEntries(ctx, &pb.AppendEntriesRequest{
-		Term:         args.Term,
-		LeaderId:     args.LeaderID,
-		PrevLogIndex: args.PrevLogIndex,
-		PrevLogTerm:  args.PrevLogTerm,
-		Entries:      pbEntries,
-		LeaderCommit: args.LeaderCommit,
-	})
-	if err != nil {
-		return AppendEntriesReply{}, err
-	}
-	return AppendEntriesReply{Term: resp.Term, Success: resp.Success}, nil
-}
-
-// -------------------------------------------------------------------------
-// gRPC Server
-// -------------------------------------------------------------------------
-
-type GRPCServer struct {
-	srv *grpc.Server
-}
-
-func NewGRPCServer() *GRPCServer { return &GRPCServer{} }
-
-func (s *GRPCServer) Start(addr string, handler Handler) error {
+// Start starts the gRPC server on the given address
+func (t *GRPCTransport) Start(addr string) error {
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("listen %s: %w", addr, err)
+		return fmt.Errorf("failed to listen on %s: %w", addr, err)
 	}
-	s.srv = grpc.NewServer()
-	pb.RegisterRaftServiceServer(s.srv, &grpcHandler{handler: handler})
-	go s.srv.Serve(lis)
+
+	t.server = grpc.NewServer()
+	pb.RegisterRaftServiceServer(t.server, t)
+
+	go func() {
+		if err := t.server.Serve(lis); err != nil {
+			log.Printf("gRPC server error: %v", err)
+		}
+	}()
+
+	log.Printf("gRPC transport listening on %s", addr)
 	return nil
 }
 
-func (s *GRPCServer) Stop() {
-	if s.srv != nil {
-		s.srv.GracefulStop()
+// Stop stops the gRPC server
+func (t *GRPCTransport) Stop() {
+	if t.server != nil {
+		t.server.GracefulStop()
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for addr, conn := range t.conns {
+		conn.Close()
+		delete(t.conns, addr)
 	}
 }
 
-// grpcHandler bridges the generated gRPC interface to our transport.Handler.
-type grpcHandler struct {
-	pb.UnimplementedRaftServiceServer
-	handler Handler
-}
-
-func (g *grpcHandler) RequestVote(_ context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
-	reply := g.handler.HandleRequestVote(RequestVoteArgs{
-		Term:         req.Term,
-		CandidateID:  req.CandidateId,
-		LastLogIndex: req.LastLogIndex,
-		LastLogTerm:  req.LastLogTerm,
-	})
-	return &pb.RequestVoteResponse{Term: reply.Term, VoteGranted: reply.VoteGranted}, nil
-}
-
-func (g *grpcHandler) AppendEntries(_ context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
-	entries := make([]LogEntry, len(req.Entries))
-	for i, e := range req.Entries {
-		entries[i] = LogEntry{Index: e.Index, Term: e.Term, Command: e.Command}
+// getConn returns a cached or new gRPC client connection
+func (t *GRPCTransport) getConn(target string) (*grpc.ClientConn, error) {
+	t.mu.RLock()
+	conn, ok := t.conns[target]
+	t.mu.RUnlock()
+	if ok {
+		return conn, nil
 	}
-	reply := g.handler.HandleAppendEntries(AppendEntriesArgs{
-		Term:         req.Term,
-		LeaderID:     req.LeaderId,
-		PrevLogIndex: req.PrevLogIndex,
-		PrevLogTerm:  req.PrevLogTerm,
-		Entries:      entries,
-		LeaderCommit: req.LeaderCommit,
-	})
-	return &pb.AppendEntriesResponse{Term: reply.Term, Success: reply.Success}, nil
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Double-check after acquiring write lock
+	if conn, ok := t.conns[target]; ok {
+		return conn, nil
+	}
+
+	conn, err := grpc.Dial(target,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithBlock(),
+		grpc.WithTimeout(5*time.Second),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to %s: %w", target, err)
+	}
+
+	t.conns[target] = conn
+	return conn, nil
+}
+
+// --- Client-side Transport methods ---
+
+// SendAppendEntries sends an AppendEntries RPC to the target node
+func (t *GRPCTransport) SendAppendEntries(target string, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
+	conn, err := t.getConn(target)
+	if err != nil {
+		return nil, err
+	}
+
+	client := pb.NewRaftServiceClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	return client.AppendEntries(ctx, req)
+}
+
+// SendRequestVote sends a RequestVote RPC to the target node
+func (t *GRPCTransport) SendRequestVote(target string, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
+	conn, err := t.getConn(target)
+	if err != nil {
+		return nil, err
+	}
+
+	client := pb.NewRaftServiceClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	return client.RequestVote(ctx, req)
+}
+
+// Get sends a ClientGet RPC to the target node
+func (t *GRPCTransport) Get(target string, req *pb.ClientGetRequest) (*pb.ClientGetResponse, error) {
+	conn, err := t.getConn(target)
+	if err != nil {
+		return nil, err
+	}
+
+	client := pb.NewRaftServiceClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	return client.ClientGet(ctx, req)
+}
+
+// Set sends a ClientSet RPC to the target node
+func (t *GRPCTransport) Set(target string, req *pb.ClientSetRequest) (*pb.ClientSetResponse, error) {
+	conn, err := t.getConn(target)
+	if err != nil {
+		return nil, err
+	}
+
+	client := pb.NewRaftServiceClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	return client.ClientSet(ctx, req)
+}
+
+// --- Server-side gRPC handlers ---
+
+// AppendEntries handles incoming AppendEntries RPCs
+func (t *GRPCTransport) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
+	t.mu.RLock()
+	handler := t.handler
+	t.mu.RUnlock()
+
+	if handler == nil {
+		return nil, fmt.Errorf("no handler registered")
+	}
+
+	return handler.HandleAppendEntries(req)
+}
+
+// RequestVote handles incoming RequestVote RPCs
+func (t *GRPCTransport) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
+	t.mu.RLock()
+	handler := t.handler
+	t.mu.RUnlock()
+
+	if handler == nil {
+		return nil, fmt.Errorf("no handler registered")
+	}
+
+	return handler.HandleRequestVote(req)
+}
+
+// ClientGet handles incoming ClientGet RPCs
+func (t *GRPCTransport) ClientGet(ctx context.Context, req *pb.ClientGetRequest) (*pb.ClientGetResponse, error) {
+	t.mu.RLock()
+	handler := t.handler
+	t.mu.RUnlock()
+
+	if handler == nil {
+		return nil, fmt.Errorf("no handler registered")
+	}
+
+	return handler.HandleClientGet(req)
+}
+
+// ClientSet handles incoming ClientSet RPCs
+func (t *GRPCTransport) ClientSet(ctx context.Context, req *pb.ClientSetRequest) (*pb.ClientSetResponse, error) {
+	t.mu.RLock()
+	handler := t.handler
+	t.mu.RUnlock()
+
+	if handler == nil {
+		return nil, fmt.Errorf("no handler registered")
+	}
+
+	return handler.HandleClientSet(req)
 }
