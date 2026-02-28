@@ -4,156 +4,68 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"strings"
-	"sync"
 
-	pb "github.com/example/raft/proto"
+	pb "github.com/revolyssup/barge/proto"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
-// normalizeAddr ensures the address has a host component for dialing.
-// Converts ":9000" to "localhost:9000".
-func normalizeAddr(addr string) string {
-	if strings.HasPrefix(addr, ":") {
-		return "localhost" + addr
-	}
-	return addr
+// NodeHandler defines the interface that the consensus node must implement
+// to handle incoming RPCs.
+type NodeHandler interface {
+	HandleAppendEntries(req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error)
+	HandleRequestVote(req *pb.VoteRequest) (*pb.VoteResponse, error)
+	HandleGet(req *pb.GetRequest) (*pb.GetResponse, error)
+	HandleSet(req *pb.SetRequest) (*pb.SetResponse, error)
 }
 
-// -------------------------------------------------------------------------
-// gRPC Client (Transport implementation)
-// -------------------------------------------------------------------------
-
-// GRPCTransport implements Transport using gRPC.
-// It maintains a pool of connections to peers.
+// GRPCTransport implements the Transport interface using gRPC
 type GRPCTransport struct {
-	mu    sync.Mutex
-	conns map[string]*grpc.ClientConn
+	pb.UnimplementedRaftServiceServer
+	server  *grpc.Server
+	handler NodeHandler
 }
 
-func NewGRPCTransport() *GRPCTransport {
-	return &GRPCTransport{conns: make(map[string]*grpc.ClientConn)}
+// NewGRPCTransport creates a new gRPC transport
+func NewGRPCTransport(handler NodeHandler) *GRPCTransport {
+	t := &GRPCTransport{
+		handler: handler,
+	}
+	t.server = grpc.NewServer()
+	pb.RegisterRaftServiceServer(t.server, t)
+	return t
 }
 
-func (t *GRPCTransport) dial(addr string) (pb.RaftServiceClient, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if conn, ok := t.conns[addr]; ok {
-		return pb.NewRaftServiceClient(conn), nil
-	}
-	dialAddr := normalizeAddr(addr)
-	conn, err := grpc.Dial(dialAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", dialAddr, err)
-	}
-	t.conns[addr] = conn
-	return pb.NewRaftServiceClient(conn), nil
-}
-
-func (t *GRPCTransport) Close() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	for _, c := range t.conns {
-		c.Close()
-	}
-}
-
-func (t *GRPCTransport) SendRequestVote(ctx context.Context, addr string, args RequestVoteArgs) (RequestVoteReply, error) {
-	client, err := t.dial(addr)
-	if err != nil {
-		return RequestVoteReply{}, err
-	}
-	resp, err := client.RequestVote(ctx, &pb.RequestVoteRequest{
-		Term:         args.Term,
-		CandidateId:  args.CandidateID,
-		LastLogIndex: args.LastLogIndex,
-		LastLogTerm:  args.LastLogTerm,
-	})
-	if err != nil {
-		return RequestVoteReply{}, err
-	}
-	return RequestVoteReply{Term: resp.Term, VoteGranted: resp.VoteGranted}, nil
-}
-
-func (t *GRPCTransport) SendAppendEntries(ctx context.Context, addr string, args AppendEntriesArgs) (AppendEntriesReply, error) {
-	client, err := t.dial(addr)
-	if err != nil {
-		return AppendEntriesReply{}, err
-	}
-	pbEntries := make([]*pb.LogEntry, len(args.Entries))
-	for i, e := range args.Entries {
-		pbEntries[i] = &pb.LogEntry{Index: e.Index, Term: e.Term, Command: e.Command}
-	}
-	resp, err := client.AppendEntries(ctx, &pb.AppendEntriesRequest{
-		Term:         args.Term,
-		LeaderId:     args.LeaderID,
-		PrevLogIndex: args.PrevLogIndex,
-		PrevLogTerm:  args.PrevLogTerm,
-		Entries:      pbEntries,
-		LeaderCommit: args.LeaderCommit,
-	})
-	if err != nil {
-		return AppendEntriesReply{}, err
-	}
-	return AppendEntriesReply{Term: resp.Term, Success: resp.Success}, nil
-}
-
-// -------------------------------------------------------------------------
-// gRPC Server
-// -------------------------------------------------------------------------
-
-type GRPCServer struct {
-	srv *grpc.Server
-}
-
-func NewGRPCServer() *GRPCServer { return &GRPCServer{} }
-
-func (s *GRPCServer) Start(addr string, handler Handler) error {
+// Start begins listening on the given address
+func (t *GRPCTransport) Start(addr string) error {
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("listen %s: %w", addr, err)
+		return fmt.Errorf("failed to listen: %v", err)
 	}
-	s.srv = grpc.NewServer()
-	pb.RegisterRaftServiceServer(s.srv, &grpcHandler{handler: handler})
-	go s.srv.Serve(lis)
+	go t.server.Serve(lis)
 	return nil
 }
 
-func (s *GRPCServer) Stop() {
-	if s.srv != nil {
-		s.srv.GracefulStop()
-	}
+// Stop gracefully stops the gRPC server
+func (t *GRPCTransport) Stop() {
+	t.server.GracefulStop()
 }
 
-// grpcHandler bridges the generated gRPC interface to our transport.Handler.
-type grpcHandler struct {
-	pb.UnimplementedRaftServiceServer
-	handler Handler
+// AppendEntries handles incoming AppendEntries RPCs
+func (t *GRPCTransport) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
+	return t.handler.HandleAppendEntries(req)
 }
 
-func (g *grpcHandler) RequestVote(_ context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
-	reply := g.handler.HandleRequestVote(RequestVoteArgs{
-		Term:         req.Term,
-		CandidateID:  req.CandidateId,
-		LastLogIndex: req.LastLogIndex,
-		LastLogTerm:  req.LastLogTerm,
-	})
-	return &pb.RequestVoteResponse{Term: reply.Term, VoteGranted: reply.VoteGranted}, nil
+// RequestVote handles incoming RequestVote RPCs
+func (t *GRPCTransport) RequestVote(ctx context.Context, req *pb.VoteRequest) (*pb.VoteResponse, error) {
+	return t.handler.HandleRequestVote(req)
 }
 
-func (g *grpcHandler) AppendEntries(_ context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
-	entries := make([]LogEntry, len(req.Entries))
-	for i, e := range req.Entries {
-		entries[i] = LogEntry{Index: e.Index, Term: e.Term, Command: e.Command}
-	}
-	reply := g.handler.HandleAppendEntries(AppendEntriesArgs{
-		Term:         req.Term,
-		LeaderID:     req.LeaderId,
-		PrevLogIndex: req.PrevLogIndex,
-		PrevLogTerm:  req.PrevLogTerm,
-		Entries:      entries,
-		LeaderCommit: req.LeaderCommit,
-	})
-	return &pb.AppendEntriesResponse{Term: reply.Term, Success: reply.Success}, nil
+// ClientGet handles incoming client get RPCs
+func (t *GRPCTransport) ClientGet(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
+	return t.handler.HandleGet(req)
+}
+
+// ClientSet handles incoming client set RPCs
+func (t *GRPCTransport) ClientSet(ctx context.Context, req *pb.SetRequest) (*pb.SetResponse, error) {
+	return t.handler.HandleSet(req)
 }
