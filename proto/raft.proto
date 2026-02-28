@@ -1,44 +1,64 @@
 syntax = "proto3";
 
-package raft;
+package proto;
 
-option go_package = "github.com/example/raft/proto";
+option go_package = "github.com/revolyssup/barge/proto";
 
-// RequestVote RPC
-message RequestVoteRequest {
-  uint64 term          = 1;
-  string candidate_id  = 2;
-  uint64 last_log_index = 3;
-  uint64 last_log_term  = 4;
+service RaftService {
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse) {}
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse) {}
+  rpc ClientGet(ClientGetRequest) returns (ClientGetResponse) {}
+  rpc ClientSet(ClientSetRequest) returns (ClientSetResponse) {}
 }
 
-message RequestVoteResponse {
-  uint64 term         = 1;
-  bool   vote_granted = 2;
-}
-
-// AppendEntries RPC (also used as heartbeat)
 message LogEntry {
-  uint64 index   = 1;
-  uint64 term    = 2;
-  bytes  command = 3;
+  uint64 term = 1;
+  uint64 index = 2;
+  string command = 3;
 }
 
 message AppendEntriesRequest {
-  uint64            term           = 1;
-  string            leader_id      = 2;
-  uint64            prev_log_index = 3;
-  uint64            prev_log_term  = 4;
-  repeated LogEntry entries        = 5;
-  uint64            leader_commit  = 6;
+  uint64 term = 1;
+  string leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated LogEntry entries = 5;
+  uint64 leader_commit = 6;
 }
 
 message AppendEntriesResponse {
-  uint64 term    = 1;
-  bool   success = 2;
+  uint64 term = 1;
+  bool success = 2;
 }
 
-service RaftService {
-  rpc RequestVote   (RequestVoteRequest)   returns (RequestVoteResponse);
-  rpc AppendEntries (AppendEntriesRequest) returns (AppendEntriesResponse);
+message RequestVoteRequest {
+  uint64 term = 1;
+  string candidate_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+}
+
+message RequestVoteResponse {
+  uint64 term = 1;
+  bool vote_granted = 2;
+}
+
+message ClientGetRequest {
+  string key = 1;
+}
+
+message ClientGetResponse {
+  string value = 1;
+  bool found = 2;
+  string error = 3;
+}
+
+message ClientSetRequest {
+  string key = 1;
+  string value = 2;
+}
+
+message ClientSetResponse {
+  bool success = 1;
+  string error = 2;
 }

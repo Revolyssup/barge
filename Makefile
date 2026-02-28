@@ -1,46 +1,24 @@
-.PHONY: all build clean test run proto
+BINARY_DIR=bin
+SERVER_BINARY=$(BINARY_DIR)/barge-server
+CLI_BINARY=$(BINARY_DIR)/barge-cli
 
-# Binary name
-BINARY := raft-server
+.PHONY: all server cli proto clean
 
-# Build directory
-BUILD_DIR := bin
+all: server cli
 
-# Go parameters
-GOCMD := go
-GOBUILD := $(GOCMD) build
-GOCLEAN := $(GOCMD) clean
-GOTEST := $(GOCMD) test
-GOMOD := $(GOCMD) mod
+server:
+	@mkdir -p $(BINARY_DIR)
+	go build -o $(SERVER_BINARY) ./cmd/server
 
-all: build
-
-build:
-	@mkdir -p $(BUILD_DIR)
-	$(GOBUILD) -o $(BUILD_DIR)/$(BINARY) ./cmd/server
-
-clean:
-	$(GOCLEAN)
-	rm -rf $(BUILD_DIR)
-
-test:
-	$(GOTEST) -v ./...
-
-tidy:
-	$(GOMOD) tidy
+cli:
+	@mkdir -p $(BINARY_DIR)
+	go build -o $(CLI_BINARY) ./cmd/cli
 
 proto:
-	protoc --go_out=. --go_opt=paths=source_relative \
-	       --go-grpc_out=. --go-grpc_opt=paths=source_relative \
-	       proto/raft.proto
+	protoc --go_out=. --go-grpc_out=. proto/raft.proto
 
-# Run a 3-node cluster locally
-run-cluster:
-	@echo "Starting 3-node Raft cluster..."
-	@$(BUILD_DIR)/$(BINARY) -id A -addr :9000 -http :8000 -peers :9001,:9002 &
-	@$(BUILD_DIR)/$(BINARY) -id B -addr :9001 -http :8001 -peers :9000,:9002 &
-	@$(BUILD_DIR)/$(BINARY) -id C -addr :9002 -http :8002 -peers :9000,:9001 &
-	@echo "Cluster started."
-	@echo "HTTP APIs: http://localhost:8000, http://localhost:8001, http://localhost:8002"
-	@echo "Press Ctrl+C to stop."
-	@wait
+clean:
+	rm -rf $(BINARY_DIR)
+
+test:
+	go test ./...

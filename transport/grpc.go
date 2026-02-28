@@ -3,157 +3,172 @@ package transport
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
-	"strings"
 	"sync"
+	"time"
 
-	pb "github.com/example/raft/proto"
+	pb "github.com/revolyssup/barge/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// normalizeAddr ensures the address has a host component for dialing.
-// Converts ":9000" to "localhost:9000".
-func normalizeAddr(addr string) string {
-	if strings.HasPrefix(addr, ":") {
-		return "localhost" + addr
-	}
-	return addr
+// ClientOperator is an interface for client-facing operations (get/set).
+type ClientOperator interface {
+	Get(key string) (string, bool)
+	ProposeSet(key, value string) error
 }
 
-// -------------------------------------------------------------------------
-// gRPC Client (Transport implementation)
-// -------------------------------------------------------------------------
-
-// GRPCTransport implements Transport using gRPC.
-// It maintains a pool of connections to peers.
 type GRPCTransport struct {
-	mu    sync.Mutex
-	conns map[string]*grpc.ClientConn
+	pb.UnimplementedRaftServiceServer
+	addr       string
+	handler    Handler
+	clientOp   ClientOperator
+	server     *grpc.Server
+	mu         sync.RWMutex
+	clients    map[string]pb.RaftServiceClient
 }
 
-func NewGRPCTransport() *GRPCTransport {
-	return &GRPCTransport{conns: make(map[string]*grpc.ClientConn)}
-}
-
-func (t *GRPCTransport) dial(addr string) (pb.RaftServiceClient, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if conn, ok := t.conns[addr]; ok {
-		return pb.NewRaftServiceClient(conn), nil
+func NewGRPCTransport(addr string) *GRPCTransport {
+	return &GRPCTransport{
+		addr:    addr,
+		clients: make(map[string]pb.RaftServiceClient),
 	}
-	dialAddr := normalizeAddr(addr)
-	conn, err := grpc.Dial(dialAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+}
+
+func (t *GRPCTransport) SetHandler(h Handler) {
+	t.handler = h
+}
+
+func (t *GRPCTransport) SetClientOperator(op ClientOperator) {
+	t.clientOp = op
+}
+
+func (t *GRPCTransport) Start() error {
+	lis, err := net.Listen("tcp", t.addr)
 	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", dialAddr, err)
+		return fmt.Errorf("failed to listen on %s: %w", t.addr, err)
 	}
-	t.conns[addr] = conn
-	return pb.NewRaftServiceClient(conn), nil
-}
 
-func (t *GRPCTransport) Close() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	for _, c := range t.conns {
-		c.Close()
-	}
-}
+	t.server = grpc.NewServer()
+	pb.RegisterRaftServiceServer(t.server, t)
 
-func (t *GRPCTransport) SendRequestVote(ctx context.Context, addr string, args RequestVoteArgs) (RequestVoteReply, error) {
-	client, err := t.dial(addr)
-	if err != nil {
-		return RequestVoteReply{}, err
-	}
-	resp, err := client.RequestVote(ctx, &pb.RequestVoteRequest{
-		Term:         args.Term,
-		CandidateId:  args.CandidateID,
-		LastLogIndex: args.LastLogIndex,
-		LastLogTerm:  args.LastLogTerm,
-	})
-	if err != nil {
-		return RequestVoteReply{}, err
-	}
-	return RequestVoteReply{Term: resp.Term, VoteGranted: resp.VoteGranted}, nil
-}
+	go func() {
+		if err := t.server.Serve(lis); err != nil {
+			log.Printf("gRPC server error: %v", err)
+		}
+	}()
 
-func (t *GRPCTransport) SendAppendEntries(ctx context.Context, addr string, args AppendEntriesArgs) (AppendEntriesReply, error) {
-	client, err := t.dial(addr)
-	if err != nil {
-		return AppendEntriesReply{}, err
-	}
-	pbEntries := make([]*pb.LogEntry, len(args.Entries))
-	for i, e := range args.Entries {
-		pbEntries[i] = &pb.LogEntry{Index: e.Index, Term: e.Term, Command: e.Command}
-	}
-	resp, err := client.AppendEntries(ctx, &pb.AppendEntriesRequest{
-		Term:         args.Term,
-		LeaderId:     args.LeaderID,
-		PrevLogIndex: args.PrevLogIndex,
-		PrevLogTerm:  args.PrevLogTerm,
-		Entries:      pbEntries,
-		LeaderCommit: args.LeaderCommit,
-	})
-	if err != nil {
-		return AppendEntriesReply{}, err
-	}
-	return AppendEntriesReply{Term: resp.Term, Success: resp.Success}, nil
-}
-
-// -------------------------------------------------------------------------
-// gRPC Server
-// -------------------------------------------------------------------------
-
-type GRPCServer struct {
-	srv *grpc.Server
-}
-
-func NewGRPCServer() *GRPCServer { return &GRPCServer{} }
-
-func (s *GRPCServer) Start(addr string, handler Handler) error {
-	lis, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("listen %s: %w", addr, err)
-	}
-	s.srv = grpc.NewServer()
-	pb.RegisterRaftServiceServer(s.srv, &grpcHandler{handler: handler})
-	go s.srv.Serve(lis)
+	log.Printf("gRPC transport listening on %s", t.addr)
 	return nil
 }
 
-func (s *GRPCServer) Stop() {
-	if s.srv != nil {
-		s.srv.GracefulStop()
+func (t *GRPCTransport) Stop() {
+	if t.server != nil {
+		t.server.GracefulStop()
 	}
 }
 
-// grpcHandler bridges the generated gRPC interface to our transport.Handler.
-type grpcHandler struct {
-	pb.UnimplementedRaftServiceServer
-	handler Handler
-}
-
-func (g *grpcHandler) RequestVote(_ context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
-	reply := g.handler.HandleRequestVote(RequestVoteArgs{
-		Term:         req.Term,
-		CandidateID:  req.CandidateId,
-		LastLogIndex: req.LastLogIndex,
-		LastLogTerm:  req.LastLogTerm,
-	})
-	return &pb.RequestVoteResponse{Term: reply.Term, VoteGranted: reply.VoteGranted}, nil
-}
-
-func (g *grpcHandler) AppendEntries(_ context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
-	entries := make([]LogEntry, len(req.Entries))
-	for i, e := range req.Entries {
-		entries[i] = LogEntry{Index: e.Index, Term: e.Term, Command: e.Command}
+func (t *GRPCTransport) getClient(addr string) (pb.RaftServiceClient, error) {
+	t.mu.RLock()
+	client, ok := t.clients[addr]
+	t.mu.RUnlock()
+	if ok {
+		return client, nil
 	}
-	reply := g.handler.HandleAppendEntries(AppendEntriesArgs{
-		Term:         req.Term,
-		LeaderID:     req.LeaderId,
-		PrevLogIndex: req.PrevLogIndex,
-		PrevLogTerm:  req.PrevLogTerm,
-		Entries:      entries,
-		LeaderCommit: req.LeaderCommit,
-	})
-	return &pb.AppendEntriesResponse{Term: reply.Term, Success: reply.Success}, nil
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	// Double-check after acquiring write lock
+	if client, ok := t.clients[addr]; ok {
+		return client, nil
+	}
+
+	conn, err := grpc.Dial(addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTimeout(5*time.Second),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to %s: %w", addr, err)
+	}
+
+	client = pb.NewRaftServiceClient(conn)
+	t.clients[addr] = client
+	return client, nil
+}
+
+func (t *GRPCTransport) SendAppendEntries(addr string, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
+	client, err := t.getClient(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	return client.AppendEntries(ctx, req)
+}
+
+func (t *GRPCTransport) SendRequestVote(addr string, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
+	client, err := t.getClient(addr)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	return client.RequestVote(ctx, req)
+}
+
+// gRPC server method implementations
+
+func (t *GRPCTransport) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
+	if t.handler == nil {
+		return nil, fmt.Errorf("no handler registered")
+	}
+	return t.handler.HandleAppendEntries(req)
+}
+
+func (t *GRPCTransport) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
+	if t.handler == nil {
+		return nil, fmt.Errorf("no handler registered")
+	}
+	return t.handler.HandleRequestVote(req)
+}
+
+func (t *GRPCTransport) ClientGet(ctx context.Context, req *pb.ClientGetRequest) (*pb.ClientGetResponse, error) {
+	if t.clientOp == nil {
+		return &pb.ClientGetResponse{
+			Error: "node not ready for client operations",
+		}, nil
+	}
+
+	value, found := t.clientOp.Get(req.Key)
+	return &pb.ClientGetResponse{
+		Value: value,
+		Found: found,
+	}, nil
+}
+
+func (t *GRPCTransport) ClientSet(ctx context.Context, req *pb.ClientSetRequest) (*pb.ClientSetResponse, error) {
+	if t.clientOp == nil {
+		return &pb.ClientSetResponse{
+			Success: false,
+			Error:   "node not ready for client operations",
+		}, nil
+	}
+
+	err := t.clientOp.ProposeSet(req.Key, req.Value)
+	if err != nil {
+		return &pb.ClientSetResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, nil
+	}
+
+	return &pb.ClientSetResponse{
+		Success: true,
+	}, nil
 }
