@@ -1,44 +1,67 @@
 syntax = "proto3";
 
-package raft;
+package proto;
 
-option go_package = "github.com/example/raft/proto";
+option go_package = "github.com/revolyssup/barge/proto";
 
-// RequestVote RPC
-message RequestVoteRequest {
-  uint64 term          = 1;
-  string candidate_id  = 2;
-  uint64 last_log_index = 3;
-  uint64 last_log_term  = 4;
+service Raft {
+    rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+    rpc RequestVote(VoteRequest) returns (VoteResponse);
 }
 
-message RequestVoteResponse {
-  uint64 term         = 1;
-  bool   vote_granted = 2;
+service KV {
+    rpc Get(GetRequest) returns (GetResponse);
+    rpc Set(SetRequest) returns (SetResponse);
 }
 
-// AppendEntries RPC (also used as heartbeat)
 message LogEntry {
-  uint64 index   = 1;
-  uint64 term    = 2;
-  bytes  command = 3;
+    uint64 term = 1;
+    uint64 index = 2;
+    string key = 3;
+    string value = 4;
 }
 
 message AppendEntriesRequest {
-  uint64            term           = 1;
-  string            leader_id      = 2;
-  uint64            prev_log_index = 3;
-  uint64            prev_log_term  = 4;
-  repeated LogEntry entries        = 5;
-  uint64            leader_commit  = 6;
+    uint64 term = 1;
+    string leaderId = 2;
+    uint64 prevLogIndex = 3;
+    uint64 prevLogTerm = 4;
+    repeated LogEntry entries = 5;
+    uint64 leaderCommit = 6;
 }
 
 message AppendEntriesResponse {
-  uint64 term    = 1;
-  bool   success = 2;
+    uint64 term = 1;
+    bool success = 2;
 }
 
-service RaftService {
-  rpc RequestVote   (RequestVoteRequest)   returns (RequestVoteResponse);
-  rpc AppendEntries (AppendEntriesRequest) returns (AppendEntriesResponse);
+message VoteRequest {
+    uint64 term = 1;
+    string candidateId = 2;
+    uint64 lastLogIndex = 3;
+    uint64 lastLogTerm = 4;
+}
+
+message VoteResponse {
+    uint64 term = 1;
+    bool voteGranted = 2;
+}
+
+message GetRequest {
+    string key = 1;
+}
+
+message GetResponse {
+    string value = 1;
+    bool found = 2;
+}
+
+message SetRequest {
+    string key = 1;
+    string value = 2;
+}
+
+message SetResponse {
+    bool success = 1;
+    string error = 2;
 }
