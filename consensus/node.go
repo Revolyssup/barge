@@ -1,440 +1,220 @@
-// Package consensus implements the Raft consensus algorithm.
-//
-// Architecture:
-//   - Node   – the main Raft state machine (leader election + log replication).
-//   - Config – how to configure a node.
-//
-// The consensus layer depends only on the transport and storage interfaces;
-// it never imports concrete implementations.
 package consensus
 
 import (
-	"context"
+	"encoding/json"
+	"fmt"
 	"log"
 	"math/rand"
 	"sync"
 	"time"
 
-	"github.com/example/raft/storage"
-	"github.com/example/raft/transport"
+	"github.com/revolyssup/barge/storage"
 )
 
-// Role represents the Raft node role.
-type Role int
+type State int
 
 const (
-	Follower Role = iota
+	Follower State = iota
 	Candidate
 	Leader
 )
 
-func (r Role) String() string {
-	return [...]string{"Follower", "Candidate", "Leader"}[r]
-}
-
-// Config holds all parameters needed to create a Raft node.
-type Config struct {
-	ID    string   // this node's identifier
-	Peers []string // addresses of all OTHER nodes (used by transport)
-
-	HeartbeatInterval  time.Duration
-	ElectionTimeoutMin time.Duration
-	ElectionTimeoutMax time.Duration
-}
-
-func DefaultConfig(id string, peers []string) Config {
-	return Config{
-		ID:                 id,
-		Peers:              peers,
-		HeartbeatInterval:  150 * time.Millisecond,
-		ElectionTimeoutMin: 300 * time.Millisecond,
-		ElectionTimeoutMax: 600 * time.Millisecond,
-	}
-}
-
-// ApplyMsg is delivered to the application state machine when a log entry is committed.
-type ApplyMsg struct {
+type LogEntry struct {
+	Term    uint64
 	Index   uint64
-	Command []byte
+	Data    []byte
 }
 
-// Node is a single Raft participant.
-type Node struct {
-	mu  sync.Mutex
-	cfg Config
+// KVCommand represents a key-value set command that is replicated through Raft.
+type KVCommand struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
 
-	// Persistent state (simplified – not actually persisted to disk here)
+type Transport interface {
+	SendAppendEntries(target string, req AppendEntriesRequest) (*AppendEntriesResponse, error)
+	SendRequestVote(target string, req RequestVoteRequest) (*RequestVoteResponse, error)
+}
+
+type AppendEntriesRequest struct {
+	Term         uint64
+	LeaderID     string
+	PrevLogIndex uint64
+	PrevLogTerm  uint64
+	Entries      []LogEntry
+	LeaderCommit uint64
+}
+
+type AppendEntriesResponse struct {
+	Term    uint64
+	Success bool
+}
+
+type RequestVoteRequest struct {
+	Term         uint64
+	CandidateID  string
+	LastLogIndex uint64
+	LastLogTerm  uint64
+}
+
+type RequestVoteResponse struct {
+	Term        uint64
+	VoteGranted bool
+}
+
+type Node struct {
+	mu          sync.Mutex
+	id          string
+	state       State
 	currentTerm uint64
 	votedFor    string
-	log         storage.LogStorage
-
-	// Volatile state
+	log         []LogEntry
 	commitIndex uint64
 	lastApplied uint64
-
-	// Leader-only volatile state
-	nextIndex  map[string]uint64
-	matchIndex map[string]uint64
-
-	role     Role
-	leaderID string
-
-	transport transport.Transport
-
-	// Channel on which committed entries are pushed to the application layer.
-	applyCh chan ApplyMsg
-
-	// Internal signals
-	resetElectionTimer chan struct{}
-	stopCh             chan struct{}
-	wg                 sync.WaitGroup
+	nextIndex   map[string]uint64
+	matchIndex  map[string]uint64
+	peers       []string
+	transport   Transport
+	storage     *storage.Storage
+	stopCh      chan struct{}
 }
 
-// NewNode creates a Raft node.  Call Start() to begin participation.
-func NewNode(cfg Config, logStore storage.LogStorage, tr transport.Transport, applyCh chan ApplyMsg) *Node {
-	return &Node{
-		cfg:                cfg,
-		log:                logStore,
-		transport:          tr,
-		applyCh:            applyCh,
-		role:               Follower,
-		resetElectionTimer: make(chan struct{}, 1),
-		stopCh:             make(chan struct{}),
-		nextIndex:          make(map[string]uint64),
-		matchIndex:         make(map[string]uint64),
+func NewNode(id string, peers []string, transport Transport, storage *storage.Storage) *Node {
+	n := &Node{
+		id:        id,
+		state:     Follower,
+		peers:     peers,
+		transport: transport,
+		storage:   storage,
+		stopCh:    make(chan struct{}),
+		log:       make([]LogEntry, 0),
 	}
+	return n
 }
 
-// Start launches background goroutines.
 func (n *Node) Start() {
-	n.wg.Add(1)
 	go n.run()
 }
 
-// Stop shuts down the node gracefully.
 func (n *Node) Stop() {
 	close(n.stopCh)
-	n.wg.Wait()
 }
-
-// Submit proposes a command to the cluster.  Returns false if this node is not the leader.
-func (n *Node) Submit(command []byte) bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if n.role != Leader {
-		return false
-	}
-	idx := n.log.LastIndex() + 1
-	entry := storage.LogEntry{Index: idx, Term: n.currentTerm, Command: command}
-	if err := n.log.AppendLog(entry); err != nil {
-		return false
-	}
-	// Trigger immediate replication
-	n.broadcastAppendEntries()
-	return true
-}
-
-// IsLeader reports whether this node currently believes itself to be the leader.
-func (n *Node) IsLeader() bool {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.role == Leader
-}
-
-// CurrentTerm returns the node's current term.
-func (n *Node) CurrentTerm() uint64 {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	return n.currentTerm
-}
-
-// -------------------------------------------------------------------------
-// transport.Handler implementation (called by the transport layer)
-// -------------------------------------------------------------------------
-
-func (n *Node) HandleRequestVote(args transport.RequestVoteArgs) transport.RequestVoteReply {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	reply := transport.RequestVoteReply{Term: n.currentTerm}
-
-	if args.Term < n.currentTerm {
-		return reply // stale
-	}
-	if args.Term > n.currentTerm {
-		n.becomeFollower(args.Term)
-	}
-
-	// Grant vote if we haven't voted yet (or already voted for this candidate)
-	// and the candidate's log is at least as up-to-date as ours.
-	lastIdx := n.log.LastIndex()
-	lastTerm := n.log.LastTerm()
-	logOK := args.LastLogTerm > lastTerm ||
-		(args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIdx)
-
-	if (n.votedFor == "" || n.votedFor == args.CandidateID) && logOK {
-		n.votedFor = args.CandidateID
-		reply.VoteGranted = true
-		n.sendResetElection()
-	}
-	reply.Term = n.currentTerm
-	return reply
-}
-
-func (n *Node) HandleAppendEntries(args transport.AppendEntriesArgs) transport.AppendEntriesReply {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	reply := transport.AppendEntriesReply{Term: n.currentTerm}
-
-	if args.Term < n.currentTerm {
-		return reply
-	}
-	if args.Term > n.currentTerm {
-		n.becomeFollower(args.Term)
-	}
-
-	// Recognize leader
-	n.role = Follower
-	n.leaderID = args.LeaderID
-	n.sendResetElection()
-
-	// Consistency check
-	if args.PrevLogIndex > 0 {
-		prevEntry, err := n.log.GetLog(args.PrevLogIndex)
-		if err != nil || prevEntry.Term != args.PrevLogTerm {
-			return reply // log doesn't match
-		}
-	}
-
-	// Append new entries (overwriting conflicts)
-	for _, e := range args.Entries {
-		existing, err := n.log.GetLog(e.Index)
-		if err == nil && existing.Term != e.Term {
-			// Conflict: truncate from here
-			_ = n.log.TruncateSuffix(e.Index)
-		}
-		if e.Index > n.log.LastIndex() {
-			_ = n.log.AppendLog(storage.LogEntry{
-				Index:   e.Index,
-				Term:    e.Term,
-				Command: e.Command,
-			})
-		}
-	}
-
-	// Advance commit index
-	if args.LeaderCommit > n.commitIndex {
-		n.commitIndex = min64(args.LeaderCommit, n.log.LastIndex())
-		n.applyLogs()
-	}
-
-	reply.Success = true
-	return reply
-}
-
-// -------------------------------------------------------------------------
-// Main run loop
-// -------------------------------------------------------------------------
 
 func (n *Node) run() {
-	defer n.wg.Done()
 	for {
 		select {
 		case <-n.stopCh:
 			return
 		default:
-		}
-
-		n.mu.Lock()
-		role := n.role
-		n.mu.Unlock()
-
-		switch role {
-		case Follower, Candidate:
-			n.runElectionTimer()
-		case Leader:
-			n.runHeartbeat()
-		}
-	}
-}
-
-func (n *Node) runElectionTimer() {
-	timeout := n.electionTimeout()
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-
-	for {
-		select {
-		case <-n.stopCh:
-			return
-		case <-n.resetElectionTimer:
-			// Received heartbeat or granted vote; reset timer.
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			timer.Reset(n.electionTimeout())
-		case <-timer.C:
-			// Timeout expired: start an election.
-			n.startElection()
-			return
-		}
-	}
-}
-
-func (n *Node) runHeartbeat() {
-	ticker := time.NewTicker(n.cfg.HeartbeatInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-n.stopCh:
-			return
-		case <-ticker.C:
 			n.mu.Lock()
-			if n.role != Leader {
-				n.mu.Unlock()
-				return
-			}
-			n.broadcastAppendEntries()
+			state := n.state
 			n.mu.Unlock()
+
+			switch state {
+			case Follower:
+				n.runFollower()
+			case Candidate:
+				n.runCandidate()
+			case Leader:
+				n.runLeader()
+			}
 		}
 	}
 }
 
-// -------------------------------------------------------------------------
-// Election
-// -------------------------------------------------------------------------
-
-func (n *Node) startElection() {
-	n.mu.Lock()
-	n.role = Candidate
-	n.currentTerm++
-	n.votedFor = n.cfg.ID
-	term := n.currentTerm
-	lastIdx := n.log.LastIndex()
-	lastTerm := n.log.LastTerm()
-	peers := n.cfg.Peers
-	n.mu.Unlock()
-
-	log.Printf("[%s] starting election for term %d", n.cfg.ID, term)
-
-	votes := 1 // vote for self
-	needed := (len(peers)+1)/2 + 1 // majority including self
-	var voteMu sync.Mutex
-	var wg sync.WaitGroup
-
-	// Single node cluster: already have majority
-	if votes >= needed {
+func (n *Node) runFollower() {
+	timeout := time.Duration(150+rand.Intn(150)) * time.Millisecond
+	select {
+	case <-time.After(timeout):
 		n.mu.Lock()
-		if n.role == Candidate && n.currentTerm == term {
-			n.becomeLeader()
-		}
+		n.state = Candidate
 		n.mu.Unlock()
+	case <-n.stopCh:
 		return
 	}
-
-	for _, peer := range peers {
-		wg.Add(1)
-		go func(addr string) {
-			defer wg.Done()
-			ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-			defer cancel()
-
-			reply, err := n.transport.SendRequestVote(ctx, addr, transport.RequestVoteArgs{
-				Term:         term,
-				CandidateID:  n.cfg.ID,
-				LastLogIndex: lastIdx,
-				LastLogTerm:  lastTerm,
-			})
-			if err != nil {
-				return
-			}
-
-			n.mu.Lock()
-			if reply.Term > n.currentTerm {
-				n.becomeFollower(reply.Term)
-				n.mu.Unlock()
-				return
-			}
-			n.mu.Unlock()
-
-			if reply.VoteGranted {
-				voteMu.Lock()
-				votes++
-				won := votes >= needed
-				voteMu.Unlock()
-				if won {
-					n.mu.Lock()
-					if n.role == Candidate && n.currentTerm == term {
-						n.becomeLeader()
-					}
-					n.mu.Unlock()
-				}
-			}
-		}(peer)
-	}
-	wg.Wait()
 }
 
-// -------------------------------------------------------------------------
-// Log replication
-// -------------------------------------------------------------------------
+func (n *Node) runCandidate() {
+	n.mu.Lock()
+	n.currentTerm++
+	n.votedFor = n.id
+	currentTerm := n.currentTerm
+	lastLogIndex := uint64(len(n.log))
+	var lastLogTerm uint64
+	if lastLogIndex > 0 {
+		lastLogTerm = n.log[lastLogIndex-1].Term
+	}
+	n.mu.Unlock()
 
-// broadcastAppendEntries sends AppendEntries to all peers.
-// Must be called with n.mu held.
-func (n *Node) broadcastAppendEntries() {
-	for _, peer := range n.cfg.Peers {
+	votes := 1
+	for _, peer := range n.peers {
+		resp, err := n.transport.SendRequestVote(peer, RequestVoteRequest{
+			Term:         currentTerm,
+			CandidateID:  n.id,
+			LastLogIndex: lastLogIndex,
+			LastLogTerm:  lastLogTerm,
+		})
+		if err != nil {
+			continue
+		}
+		if resp.VoteGranted {
+			votes++
+		}
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if votes > (len(n.peers)+1)/2 {
+		n.state = Leader
+		n.nextIndex = make(map[string]uint64)
+		n.matchIndex = make(map[string]uint64)
+		for _, peer := range n.peers {
+			n.nextIndex[peer] = uint64(len(n.log)) + 1
+			n.matchIndex[peer] = 0
+		}
+	}
+}
+
+func (n *Node) runLeader() {
+	n.mu.Lock()
+	for _, peer := range n.peers {
 		go n.sendAppendEntries(peer)
+	}
+	n.mu.Unlock()
+
+	select {
+	case <-time.After(50 * time.Millisecond):
+	case <-n.stopCh:
+		return
 	}
 }
 
 func (n *Node) sendAppendEntries(peer string) {
 	n.mu.Lock()
-	if n.role != Leader {
-		n.mu.Unlock()
-		return
-	}
-
 	nextIdx := n.nextIndex[peer]
-	if nextIdx == 0 {
-		nextIdx = 1
-	}
 	prevLogIndex := nextIdx - 1
 	var prevLogTerm uint64
-	if prevLogIndex > 0 {
-		if e, err := n.log.GetLog(prevLogIndex); err == nil {
-			prevLogTerm = e.Term
-		}
+	if prevLogIndex > 0 && prevLogIndex <= uint64(len(n.log)) {
+		prevLogTerm = n.log[prevLogIndex-1].Term
 	}
 
-	lastIdx := n.log.LastIndex()
-	var entries []transport.LogEntry
-	for i := nextIdx; i <= lastIdx; i++ {
-		e, err := n.log.GetLog(i)
-		if err != nil {
-			break
-		}
-		entries = append(entries, transport.LogEntry{Index: e.Index, Term: e.Term, Command: e.Command})
+	var entries []LogEntry
+	if nextIdx <= uint64(len(n.log)) {
+		entries = n.log[nextIdx-1:]
 	}
 
-	args := transport.AppendEntriesArgs{
+	req := AppendEntriesRequest{
 		Term:         n.currentTerm,
-		LeaderID:     n.cfg.ID,
+		LeaderID:     n.id,
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm:  prevLogTerm,
 		Entries:      entries,
 		LeaderCommit: n.commitIndex,
 	}
-	term := n.currentTerm
 	n.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-
-	reply, err := n.transport.SendAppendEntries(ctx, peer, args)
+	resp, err := n.transport.SendAppendEntries(peer, req)
 	if err != nil {
 		return
 	}
@@ -442,116 +222,171 @@ func (n *Node) sendAppendEntries(peer string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	if reply.Term > n.currentTerm {
-		n.becomeFollower(reply.Term)
-		return
-	}
-	if n.role != Leader || n.currentTerm != term {
-		return
-	}
-
-	if reply.Success {
-		newMatch := prevLogIndex + uint64(len(entries))
-		if newMatch > n.matchIndex[peer] {
-			n.matchIndex[peer] = newMatch
-		}
-		n.nextIndex[peer] = n.matchIndex[peer] + 1
-		n.advanceCommitIndex()
+	if resp.Success {
+		n.nextIndex[peer] = nextIdx + uint64(len(entries))
+		n.matchIndex[peer] = n.nextIndex[peer] - 1
+		n.updateCommitIndex()
 	} else {
-		// Back off
 		if n.nextIndex[peer] > 1 {
 			n.nextIndex[peer]--
 		}
 	}
 }
 
-// advanceCommitIndex finds the highest index replicated on a majority.
-// Must be called with n.mu held.
-func (n *Node) advanceCommitIndex() {
-	lastIdx := n.log.LastIndex()
-	for idx := lastIdx; idx > n.commitIndex; idx-- {
-		e, err := n.log.GetLog(idx)
-		if err != nil || e.Term != n.currentTerm {
-			continue
-		}
-		count := 1 // self
-		for _, peer := range n.cfg.Peers {
-			if n.matchIndex[peer] >= idx {
+func (n *Node) updateCommitIndex() {
+	for i := uint64(len(n.log)); i > n.commitIndex; i-- {
+		count := 1
+		for _, peer := range n.peers {
+			if n.matchIndex[peer] >= i {
 				count++
 			}
 		}
-		needed := (len(n.cfg.Peers)+1)/2 + 1
-		if count >= needed {
-			n.commitIndex = idx
-			n.applyLogs()
+		if count > (len(n.peers)+1)/2 && n.log[i-1].Term == n.currentTerm {
+			n.commitIndex = i
+			n.applyEntries()
 			break
 		}
 	}
 }
 
-// -------------------------------------------------------------------------
-// State transitions (must be called with n.mu held)
-// -------------------------------------------------------------------------
-
-func (n *Node) becomeFollower(term uint64) {
-	log.Printf("[%s] → Follower (term %d)", n.cfg.ID, term)
-	n.role = Follower
-	n.currentTerm = term
-	n.votedFor = ""
-	n.sendResetElection()
-}
-
-func (n *Node) becomeLeader() {
-	log.Printf("[%s] → Leader (term %d)", n.cfg.ID, n.currentTerm)
-	n.role = Leader
-	n.leaderID = n.cfg.ID
-	lastIdx := n.log.LastIndex()
-	for _, peer := range n.cfg.Peers {
-		n.nextIndex[peer] = lastIdx + 1
-		n.matchIndex[peer] = 0
-	}
-}
-
-// -------------------------------------------------------------------------
-// Apply loop
-// -------------------------------------------------------------------------
-
-// applyLogs delivers committed-but-not-yet-applied entries to the apply channel.
-// Must be called with n.mu held.
-func (n *Node) applyLogs() {
+func (n *Node) applyEntries() {
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
-		e, err := n.log.GetLog(n.lastApplied)
-		if err != nil {
-			break
+		entry := n.log[n.lastApplied-1]
+		var cmd KVCommand
+		if err := json.Unmarshal(entry.Data, &cmd); err != nil {
+			log.Printf("failed to unmarshal log entry %d: %v", entry.Index, err)
+			continue
 		}
-		select {
-		case n.applyCh <- ApplyMsg{Index: e.Index, Command: e.Command}:
-		default:
+		n.storage.Set(cmd.Key, []byte(cmd.Value))
+		log.Printf("applied entry %d: SET %s = %s", entry.Index, cmd.Key, cmd.Value)
+	}
+}
+
+func (n *Node) HandleAppendEntries(req AppendEntriesRequest) AppendEntriesResponse {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if req.Term < n.currentTerm {
+		return AppendEntriesResponse{Term: n.currentTerm, Success: false}
+	}
+
+	if req.Term > n.currentTerm {
+		n.currentTerm = req.Term
+		n.votedFor = ""
+	}
+	n.state = Follower
+
+	if req.PrevLogIndex > 0 {
+		if req.PrevLogIndex > uint64(len(n.log)) {
+			return AppendEntriesResponse{Term: n.currentTerm, Success: false}
+		}
+		if n.log[req.PrevLogIndex-1].Term != req.PrevLogTerm {
+			return AppendEntriesResponse{Term: n.currentTerm, Success: false}
 		}
 	}
-}
 
-// -------------------------------------------------------------------------
-// Helpers
-// -------------------------------------------------------------------------
-
-func (n *Node) electionTimeout() time.Duration {
-	lo := int64(n.cfg.ElectionTimeoutMin)
-	hi := int64(n.cfg.ElectionTimeoutMax)
-	return time.Duration(lo + rand.Int63n(hi-lo))
-}
-
-func (n *Node) sendResetElection() {
-	select {
-	case n.resetElectionTimer <- struct{}{}:
-	default:
+	for i, entry := range req.Entries {
+		idx := req.PrevLogIndex + uint64(i) + 1
+		if idx <= uint64(len(n.log)) {
+			if n.log[idx-1].Term != entry.Term {
+				n.log = n.log[:idx-1]
+				n.log = append(n.log, entry)
+			}
+		} else {
+			n.log = append(n.log, entry)
+		}
 	}
+
+	if req.LeaderCommit > n.commitIndex {
+		n.commitIndex = req.LeaderCommit
+		if uint64(len(n.log)) < n.commitIndex {
+			n.commitIndex = uint64(len(n.log))
+		}
+		n.applyEntries()
+	}
+
+	return AppendEntriesResponse{Term: n.currentTerm, Success: true}
 }
 
-func min64(a, b uint64) uint64 {
-	if a < b {
-		return a
+func (n *Node) HandleRequestVote(req RequestVoteRequest) RequestVoteResponse {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if req.Term < n.currentTerm {
+		return RequestVoteResponse{Term: n.currentTerm, VoteGranted: false}
 	}
-	return b
+
+	if req.Term > n.currentTerm {
+		n.currentTerm = req.Term
+		n.votedFor = ""
+		n.state = Follower
+	}
+
+	if n.votedFor == "" || n.votedFor == req.CandidateID {
+		lastLogIndex := uint64(len(n.log))
+		var lastLogTerm uint64
+		if lastLogIndex > 0 {
+			lastLogTerm = n.log[lastLogIndex-1].Term
+		}
+
+		if req.LastLogTerm > lastLogTerm || (req.LastLogTerm == lastLogTerm && req.LastLogIndex >= lastLogIndex) {
+			n.votedFor = req.CandidateID
+			return RequestVoteResponse{Term: n.currentTerm, VoteGranted: true}
+		}
+	}
+
+	return RequestVoteResponse{Term: n.currentTerm, VoteGranted: false}
+}
+
+// Get retrieves a value from the node's local storage.
+func (n *Node) Get(key string) (string, bool) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	val, err := n.storage.Get(key)
+	if err != nil {
+		return "", false
+	}
+	return string(val), true
+}
+
+// Propose proposes a key-value set command to the Raft cluster.
+// Only the leader can accept proposals. Returns an error if this node is not the leader.
+func (n *Node) Propose(key, value string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.state != Leader {
+		return fmt.Errorf("not the leader")
+	}
+
+	cmd := KVCommand{Key: key, Value: value}
+	data, err := json.Marshal(cmd)
+	if err != nil {
+		return fmt.Errorf("failed to marshal command: %w", err)
+	}
+
+	entry := LogEntry{
+		Term:  n.currentTerm,
+		Index: uint64(len(n.log)) + 1,
+		Data:  data,
+	}
+	n.log = append(n.log, entry)
+
+	return nil
+}
+
+// IsLeader returns true if the node is currently the leader.
+func (n *Node) IsLeader() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.state == Leader
+}
+
+// GetState returns the current state of the node.
+func (n *Node) GetState() State {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.state
 }
